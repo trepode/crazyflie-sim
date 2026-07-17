@@ -216,3 +216,40 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Personal Docker configuration
+.env
+compose.local.yaml
+compose.override.yaml
+
+# Simulation outputs
+outputs/*
+!outputs/.gitkeep
+
+# Logs and recordings
+logs/
+recordings/
+*.bag
+*.db3
+*.mcap
+
+# ROS and colcon
+build/
+install/
+log/
+
+# Gazebo cache
+.gazebo/
+.gz/
+
+# Temporary files
+*.tmp
+*.log
+*~
+
+# IDE settings
+.vscode/
+.idea/
+
+# macOS
+.DS_Store

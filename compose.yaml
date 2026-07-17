@@ -1,0 +1,11 @@
+services:
+  crazysim:
+    image: ${CRAZYSIM_IMAGE}
+
+    working_dir: /workspace/crazyflie-project
+
+    volumes:
+      - .:/workspace/crazyflie-project
+
+    stdin_open: true
+    tty: true
