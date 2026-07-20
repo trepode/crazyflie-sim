@@ -253,3 +253,4 @@ log/
 
 # macOS
 .DS_Store
+scripts/cache/
