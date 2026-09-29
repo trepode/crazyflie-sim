@@ -5,6 +5,8 @@ from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
 from cflib.positioning.motion_commander import MotionCommander
 
+import natnet
+
 
 URI = "radio://0/80/2M/E7E7E7E7E3"
 
