@@ -1,7 +1,14 @@
 import time
 import math
 import warnings
+import logging
 
+# ============================================================
+# SUPPRESS WARNINGS
+# ============================================================
+
+warnings.filterwarnings("ignore")
+logging.disable(logging.WARNING)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import cflib.crtp
@@ -16,17 +23,26 @@ from natnet_tracker import NatNetTracker
 # CONFIGURATION
 # ============================================================
 
-URI = "radio://0/80/2M/E7E7E7E7E9"
+URI = "radio://0/80/2M/E7E7E7E7E7"
 MOTIVE_ID = 2
 
 FLIGHT_HEIGHT = 0.5
 
-# Very conservative calibration speed
-SPEED = 0.10
-MOVE_TIME = 2.0
-STOP_TIME = 2.0
+# Small calibration velocity
+SPEED = 0.06
 
+# Each movement lasts 1 second
+MOVE_TIME = 1.0
+
+# Wait between movements
+STABILIZE_TIME = 2.0
+
+# Loop period
 DT = 0.02
+
+# Motive acquisition
+REQUIRED_VALID_SAMPLES = 20
+MOTIVE_TIMEOUT = 10.0
 
 
 # ============================================================
@@ -38,7 +54,7 @@ def create_tracker():
     tracker = NatNetTracker(
         server_ip="127.0.0.1",
         local_ip="127.0.0.1",
-        use_multicast=False,
+        use_multicast=False
     )
 
     tracker.connect()
@@ -49,6 +65,16 @@ def create_tracker():
 
 
 def get_motive_position(tracker):
+    """
+    Read current rigid-body position from Motive.
+
+    Returns:
+        (X_motive, Y_motive, Z_motive)
+
+    In our setup:
+        Motive Y = vertical
+        Motive X-Z = horizontal plane
+    """
 
     tracker.update()
 
@@ -63,88 +89,205 @@ def get_motive_position(tracker):
 
 
 # ============================================================
-# AVERAGE MOTIVE POSITION
+# STOP CRAZYFLIE
 # ============================================================
 
-def average_position(tracker, duration=0.5):
+def send_stop(cf):
 
-    xs = []
-    ys = []
-    zs = []
-
-    start = time.monotonic()
-
-    while time.monotonic() - start < duration:
-
-        position = get_motive_position(tracker)
-
-        if position is not None:
-
-            x, y, z = position
-
-            xs.append(x)
-            ys.append(y)
-            zs.append(z)
-
-        time.sleep(DT)
-
-    if not xs:
-        return None
-
-    return (
-        sum(xs) / len(xs),
-        sum(ys) / len(ys),
-        sum(zs) / len(zs),
+    cf.commander.send_velocity_world_setpoint(
+        0.0,
+        0.0,
+        0.0,
+        0.0
     )
 
 
 # ============================================================
-# STOP
+# WAIT FOR MOTIVE AFTER TAKEOFF
 # ============================================================
 
-def stop_drone(cf, tracker, duration=STOP_TIME):
+def wait_for_motive(tracker, cf):
 
-    start = time.monotonic()
+    print()
+    print("Waiting for stable Motive tracking...")
 
-    while time.monotonic() - start < duration:
+    positions = []
 
-        cf.commander.send_velocity_world_setpoint(
-            0.0,
-            0.0,
-            0.0,
-            0.0
-        )
+    start_time = time.monotonic()
 
+    while (
+        time.monotonic() - start_time
+        < MOTIVE_TIMEOUT
+    ):
+
+        send_stop(cf)
+
+        position = get_motive_position(tracker)
+
+        if position is None:
+
+            positions = []
+
+        else:
+
+            positions.append(position)
+
+            if len(positions) >= REQUIRED_VALID_SAMPLES:
+
+                # Average the valid samples
+                x = sum(
+                    p[0] for p in positions
+                ) / len(positions)
+
+                y = sum(
+                    p[1] for p in positions
+                ) / len(positions)
+
+                z = sum(
+                    p[2] for p in positions
+                ) / len(positions)
+
+                print(
+                    f"Motive stable: "
+                    f"{REQUIRED_VALID_SAMPLES} samples."
+                )
+
+                return x, y, z
+
+        time.sleep(DT)
+
+    return None
+
+
+# ============================================================
+# STABILIZE DRONE
+# ============================================================
+
+def stabilize(cf, tracker, duration):
+
+    start_time = time.monotonic()
+
+    while (
+        time.monotonic() - start_time
+        < duration
+    ):
+
+        send_stop(cf)
+
+        # Keep NatNet updated
         tracker.update()
 
         time.sleep(DT)
 
 
 # ============================================================
-# MOVEMENT TEST
+# AVERAGE MOTIVE POSITION
 # ============================================================
 
-def movement_test(cf, tracker, name, vx, vy):
+def average_position(
+    tracker,
+    duration=0.3
+):
+    """
+    Average Motive measurements for a short period.
 
-    print()
-    print("=" * 60)
-    print(f"TEST {name}")
-    print(f"Crazyflie command: vx={vx:+.3f}, vy={vy:+.3f}")
-    print("=" * 60)
+    This gives a cleaner starting position than using
+    only one measurement.
+    """
 
-    # Let the drone stabilize
-    stop_drone(cf, tracker)
+    positions = []
 
-    start_pos = average_position(
-        tracker,
-        duration=0.5
-    )
+    start_time = time.monotonic()
 
-    if start_pos is None:
-        print("ERROR: Motive tracking lost.")
+    while (
+        time.monotonic() - start_time
+        < duration
+    ):
+
+        position = get_motive_position(
+            tracker
+        )
+
+        if position is not None:
+
+            positions.append(
+                position
+            )
+
+        time.sleep(DT)
+
+    if len(positions) == 0:
         return None
 
-    sx, sy, sz = start_pos
+    x = sum(
+        p[0] for p in positions
+    ) / len(positions)
+
+    y = sum(
+        p[1] for p in positions
+    ) / len(positions)
+
+    z = sum(
+        p[2] for p in positions
+    ) / len(positions)
+
+    return x, y, z
+
+
+# ============================================================
+# SINGLE CALIBRATION TEST
+# ============================================================
+
+def calibration_movement(
+    cf,
+    tracker,
+    name,
+    vx_cf,
+    vy_cf
+):
+
+    print()
+    print("=" * 65)
+    print(f"TEST {name}")
+    print("=" * 65)
+
+    print(
+        f"Crazyflie command: "
+        f"vx={vx_cf:+.3f} m/s   "
+        f"vy={vy_cf:+.3f} m/s"
+    )
+
+    # --------------------------------------------------------
+    # 1. STABILIZE
+    # --------------------------------------------------------
+
+    print("Stabilizing...")
+
+    stabilize(
+        cf,
+        tracker,
+        STABILIZE_TIME
+    )
+
+    # --------------------------------------------------------
+    # 2. MEASURE START POSITION
+    # --------------------------------------------------------
+
+    start_position = average_position(
+        tracker
+    )
+
+    if start_position is None:
+
+        print(
+            "ERROR: Motive position unavailable."
+        )
+
+        send_stop(cf)
+
+        return None
+
+    sx, sy, sz = start_position
 
     print(
         f"Motive START: "
@@ -154,45 +297,61 @@ def movement_test(cf, tracker, name, vx, vy):
     )
 
     # --------------------------------------------------------
-    # Move
+    # 3. MOVE
     # --------------------------------------------------------
 
-    start_time = time.monotonic()
+    movement_start = time.monotonic()
 
-    while time.monotonic() - start_time < MOVE_TIME:
+    last_position = start_position
 
+    while (
+        time.monotonic() - movement_start
+        < MOVE_TIME
+    ):
+
+        # Send velocity in CRAZYFLIE world frame
         cf.commander.send_velocity_world_setpoint(
-            vx,
-            vy,
+            vx_cf,
+            vy_cf,
             0.0,
             0.0
         )
 
-        tracker.update()
+        # Measure position with MOTIVE
+        position = get_motive_position(
+            tracker
+        )
+
+        if position is not None:
+
+            last_position = position
 
         time.sleep(DT)
 
-    # Stop again
-    stop_drone(cf, tracker)
+    # --------------------------------------------------------
+    # 4. SAVE END POSITION BEFORE STOPPING
+    # --------------------------------------------------------
 
-    end_pos = average_position(
-        tracker,
-        duration=0.5
-    )
+    ex, ey, ez = last_position
 
-    if end_pos is None:
-        print("ERROR: Motive tracking lost.")
-        return None
+    # --------------------------------------------------------
+    # 5. STOP
+    # --------------------------------------------------------
 
-    ex, ey, ez = end_pos
+    send_stop(cf)
+
+    # --------------------------------------------------------
+    # 6. CALCULATE DISPLACEMENT
+    # --------------------------------------------------------
 
     dx = ex - sx
     dy = ey - sy
     dz = ez - sz
 
-    # Horizontal displacement in Motive
+    # Motive horizontal plane is X-Z
     horizontal_distance = math.sqrt(
-        dx * dx + dz * dz
+        dx ** 2 +
+        dz ** 2
     )
 
     print(
@@ -203,6 +362,7 @@ def movement_test(cf, tracker, name, vx, vy):
     )
 
     print()
+
     print(
         f"Delta Motive: "
         f"dX={dx:+.3f} "
@@ -215,36 +375,92 @@ def movement_test(cf, tracker, name, vx, vy):
         f"{horizontal_distance:.3f} m"
     )
 
-    # Unit direction in Motive X-Z
+    # --------------------------------------------------------
+    # 7. NORMALIZE HORIZONTAL DIRECTION
+    # --------------------------------------------------------
+
     if horizontal_distance > 0.01:
 
-        ux = dx / horizontal_distance
-        uz = dz / horizontal_distance
+        dir_x = (
+            dx / horizontal_distance
+        )
+
+        dir_z = (
+            dz / horizontal_distance
+        )
 
         print(
             f"Direction Motive X-Z: "
-            f"({ux:+.3f}, {uz:+.3f})"
+            f"({dir_x:+.3f}, "
+            f"{dir_z:+.3f})"
         )
 
     else:
 
-        ux = None
-        uz = None
+        dir_x = 0.0
+        dir_z = 0.0
 
         print(
-            "WARNING: horizontal movement too small "
-            "to determine direction."
+            "WARNING: horizontal movement "
+            "too small for calibration."
         )
 
+    # --------------------------------------------------------
+    # RETURN RESULT
+    # --------------------------------------------------------
+
     return {
+
         "name": name,
+
+        "vx_cf": vx_cf,
+        "vy_cf": vy_cf,
+
         "dx": dx,
         "dy": dy,
         "dz": dz,
-        "distance": horizontal_distance,
-        "ux": ux,
-        "uz": uz,
+
+        "distance":
+            horizontal_distance,
+
+        "dir_x": dir_x,
+        "dir_z": dir_z
     }
+
+
+# ============================================================
+# PRINT FINAL RESULTS
+# ============================================================
+
+def print_results(results):
+
+    print()
+    print()
+    print("=" * 76)
+    print("CALIBRATION RESULTS")
+    print("=" * 76)
+
+    print(
+        f"{'CF command':<12}"
+        f"{'dX Motive':>14}"
+        f"{'dZ Motive':>14}"
+        f"{'dir X':>14}"
+        f"{'dir Z':>14}"
+    )
+
+    print("-" * 76)
+
+    for r in results:
+
+        print(
+            f"{r['name']:<12}"
+            f"{r['dx']:>+14.3f}"
+            f"{r['dz']:>+14.3f}"
+            f"{r['dir_x']:>+14.3f}"
+            f"{r['dir_z']:>+14.3f}"
+        )
+
+    print("=" * 76)
 
 
 # ============================================================
@@ -253,162 +469,234 @@ def movement_test(cf, tracker, name, vx, vy):
 
 def main():
 
-    tracker = create_tracker()
-
-    cflib.crtp.init_drivers()
-
-    results = []
+    tracker = None
 
     try:
 
-        print(f"Connecting to {URI}")
+        # ====================================================
+        # CONNECT MOTIVE
+        # ====================================================
+
+        tracker = create_tracker()
+
+        # ====================================================
+        # INITIALIZE CRAZYFLIE
+        # ====================================================
+
+        cflib.crtp.init_drivers()
+
+        print(
+            f"Connecting to {URI}"
+        )
+
+        # ====================================================
+        # CONNECT RADIO
+        # ====================================================
 
         with SyncCrazyflie(
             URI,
-            cf=Crazyflie(rw_cache="./cache")
+            cf=Crazyflie(
+                rw_cache="./cache"
+            )
         ) as scf:
 
-            print("Crazyflie connected.")
-
-            # Make sure Motive sees the drone
-            position = get_motive_position(tracker)
-
-            if position is None:
-
-                print(
-                    f"ERROR: Motive rigid body "
-                    f"{MOTIVE_ID} not found."
-                )
-
-                return
-
             print(
-                f"Motive rigid body "
-                f"{MOTIVE_ID} found."
+                "Crazyflie connected."
             )
 
-            print()
-            print("Starting takeoff...")
+            # =================================================
+            # TAKEOFF
+            # =================================================
+
+            print("Taking off...")
 
             with MotionCommander(
                 scf,
                 default_height=FLIGHT_HEIGHT
             ):
 
-                print("Takeoff completed.")
-
-                # Stabilization
-                stop_drone(
-                    scf.cf,
-                    tracker,
-                    duration=2.0
+                print(
+                    "Takeoff complete."
                 )
 
-                # --------------------------------------------
-                # CF +X
-                # --------------------------------------------
+                # =============================================
+                # WAIT FOR MOTIVE AFTER TAKEOFF
+                # =============================================
 
-                result = movement_test(
-                    scf.cf,
-                    tracker,
-                    "+X",
-                    +SPEED,
-                    0.0
+                initial_position = (
+                    wait_for_motive(
+                        tracker,
+                        scf.cf
+                    )
                 )
 
-                if result:
-                    results.append(result)
+                if initial_position is None:
 
-                # --------------------------------------------
-                # CF -X
-                # --------------------------------------------
+                    print(
+                        "Motive did not acquire "
+                        "the drone."
+                    )
 
-                result = movement_test(
-                    scf.cf,
-                    tracker,
-                    "-X",
-                    -SPEED,
-                    0.0
+                    print(
+                        "Landing."
+                    )
+
+                    return
+
+                print()
+
+                print(
+                    "Initial Motive position:"
                 )
 
-                if result:
-                    results.append(result)
-
-                # --------------------------------------------
-                # CF +Y
-                # --------------------------------------------
-
-                result = movement_test(
-                    scf.cf,
-                    tracker,
-                    "+Y",
-                    0.0,
-                    +SPEED
-                )
-
-                if result:
-                    results.append(result)
-
-                # --------------------------------------------
-                # CF -Y
-                # --------------------------------------------
-
-                result = movement_test(
-                    scf.cf,
-                    tracker,
-                    "-Y",
-                    0.0,
-                    -SPEED
-                )
-
-                if result:
-                    results.append(result)
-
-                stop_drone(
-                    scf.cf,
-                    tracker
+                print(
+                    f"X={initial_position[0]:+.3f} "
+                    f"Y={initial_position[1]:+.3f} "
+                    f"Z={initial_position[2]:+.3f}"
                 )
 
                 print()
-                print("Calibration completed.")
-                print("Landing...")
-
-        # ====================================================
-        # SUMMARY
-        # ====================================================
-
-        print()
-        print("=" * 60)
-        print("CALIBRATION SUMMARY")
-        print("=" * 60)
-
-        for r in results:
-
-            print(
-                f"{r['name']:>3} CF  ->  "
-                f"Motive dX={r['dx']:+.3f}  "
-                f"dZ={r['dz']:+.3f}"
-            )
-
-            if r["ux"] is not None:
+                print(
+                    "Starting calibration."
+                )
 
                 print(
-                    f"          unit direction X-Z = "
-                    f"({r['ux']:+.3f}, "
-                    f"{r['uz']:+.3f})"
+                    "CTRL+C to stop and land."
                 )
+
+                # =============================================
+                # CALIBRATION TESTS
+                # =============================================
+
+                tests = [
+
+                    (
+                        "+X",
+                        +SPEED,
+                        0.0
+                    ),
+
+                    (
+                        "-X",
+                        -SPEED,
+                        0.0
+                    ),
+
+                    (
+                        "+Y",
+                        0.0,
+                        +SPEED
+                    ),
+
+                    (
+                        "-Y",
+                        0.0,
+                        -SPEED
+                    )
+                ]
+
+                results = []
+
+                for (
+                    name,
+                    vx,
+                    vy
+                ) in tests:
+
+                    result = (
+                        calibration_movement(
+                            scf.cf,
+                            tracker,
+                            name,
+                            vx,
+                            vy
+                        )
+                    )
+
+                    if result is not None:
+
+                        results.append(
+                            result
+                        )
+
+                # =============================================
+                # STOP
+                # =============================================
+
+                send_stop(
+                    scf.cf
+                )
+
+                # =============================================
+                # RESULTS
+                # =============================================
+
+                print_results(
+                    results
+                )
+
+                print()
+                print(
+                    "Calibration complete."
+                )
+
+                print(
+                    "Landing..."
+                )
+
+            # MotionCommander exits -> landing
+
+            print(
+                "MotionCommander closed."
+            )
+
+        # SyncCrazyflie exits -> radio closes
+
+        print(
+            "Crazyflie radio connection closed."
+        )
+
+
+    # ========================================================
+    # CTRL+C
+    # ========================================================
 
     except KeyboardInterrupt:
 
         print()
-        print("Test interrupted.")
+        print(
+            "CTRL+C received -> "
+            "stopping and landing."
+        )
+
+
+    # ========================================================
+    # ALWAYS CLOSE NATNET
+    # ========================================================
 
     finally:
 
-        tracker.close()
+        if tracker is not None:
 
-        print("NatNet closed.")
+            try:
 
+                tracker.close()
+
+                print(
+                    "NatNet connection closed."
+                )
+
+            except Exception:
+                pass
+
+        print(
+            "Program terminated."
+        )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
