@@ -64,11 +64,11 @@ class NatNetTracker:
         with self._lock:
             self._num_frames += 1
 
-            # Update the latest state of every rigid body in this frame.
-            for rigid_body in data_frame.rigid_bodies:
-                self._rigid_bodies[rigid_body.id_num] = rigid_body
+            self._rigid_bodies = {
+                rigid_body.id_num: rigid_body
+                for rigid_body in data_frame.rigid_bodies
+            }
 
-            # Signal that at least one frame has been received.
             self._first_frame_event.set()
 
     def _on_description_received(self, desc: DataDescriptions):

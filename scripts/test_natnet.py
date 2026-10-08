@@ -1,7 +1,9 @@
 import time
+import warnings
 
 from natnet_tracker import NatNetTracker
 
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 tracker = NatNetTracker(
     server_ip="127.0.0.1",

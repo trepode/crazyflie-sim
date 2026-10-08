@@ -19,7 +19,7 @@ from cflib.crazyflie.swarm import CachedCfFactory, Swarm
 # ============================================================
 
 URIS = [
-    'radio://0/80/2M/E7E7E7E7E5',
+    'radio://0/80/2M/E7E7E7E7E7',
     'radio://0/80/2M/E7E7E7E7E9',
 ]
 

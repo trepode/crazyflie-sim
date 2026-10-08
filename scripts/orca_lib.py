@@ -1,5 +1,7 @@
 import math
+import warnings
 
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 EPS = 1e-8
 
@@ -236,49 +238,72 @@ def compute_orca_constraint(
 
 def choose_orca_velocity(v_pref, line_point, line_direction, max_speed):
     """
-    Select the velocity closest to v_pref
-    that satisfies one ORCA half-plane.
+    Find the velocity closest to v_pref satisfying:
+      - the ORCA half-plane
+      - the maximum speed constraint
     """
+    import math
 
-    # Normal pointing toward the allowed side
-    normal = (
-        -line_direction[1],
-        line_direction[0]
-    )
+    dx, dy = normalize(line_direction)
+    nx, ny = -dy, dx
 
-    relative = (
-        v_pref[0] - line_point[0],
-        v_pref[1] - line_point[1]
-    )
+    # Allowed side: dot(v - line_point, normal) >= 0
+    offset = line_point[0] * nx + line_point[1] * ny
 
-    violation = dot(relative, normal)
-
-    # --------------------------------------------------
-    # Preferred velocity is outside the allowed region
-    # --------------------------------------------------
-
-    if violation < 0.0:
-
-        v_new = (
-            v_pref[0] - violation * normal[0],
-            v_pref[1] - violation * normal[1]
+    def feasible(v):
+        return (
+            dot(v, (nx, ny)) >= offset - 1e-9
+            and norm(v) <= max_speed + 1e-9
         )
 
-    else:
+    # Preferred velocity if already feasible
+    if feasible(v_pref):
+        return v_pref
 
-        v_new = v_pref
+    candidates = []
 
-    # --------------------------------------------------
-    # Enforce maximum speed
-    # --------------------------------------------------
-
-    speed = norm(v_new)
-
+    # Projection onto the speed disk
+    speed = norm(v_pref)
     if speed > max_speed:
+        v_disk = (
+            v_pref[0] * max_speed / speed,
+            v_pref[1] * max_speed / speed
+        )
+    else:
+        v_disk = v_pref
 
-        v_new = (
-            v_new[0] / speed * max_speed,
-            v_new[1] / speed * max_speed
+    if feasible(v_disk):
+        candidates.append(v_disk)
+
+    # Intersection of ORCA boundary and speed disk
+    if abs(offset) <= max_speed:
+        tangent = math.sqrt(max(0.0, max_speed**2 - offset**2))
+
+        for sign in (-1.0, 1.0):
+            candidate = (
+                offset * nx + sign * tangent * dx,
+                offset * ny + sign * tangent * dy
+            )
+            if feasible(candidate):
+                candidates.append(candidate)
+
+        # Orthogonal projection onto ORCA boundary
+        signed_distance = dot(v_pref, (nx, ny)) - offset
+        projection = (
+            v_pref[0] - signed_distance * nx,
+            v_pref[1] - signed_distance * ny
         )
 
-    return v_new
+        if feasible(projection):
+            candidates.append(projection)
+
+    if not candidates:
+        raise ValueError("No feasible ORCA velocity")
+
+    return min(
+        candidates,
+        key=lambda v: (
+            (v[0] - v_pref[0])**2
+            + (v[1] - v_pref[1])**2
+        )
+    )

@@ -70,26 +70,16 @@ from orca_lib import (
 # CONFIGURATION
 # ============================================================
 
-# ------------------------------------------------------------
-# CRAZYFLIE
-# ------------------------------------------------------------
-
+# drones addresses
 URI_1 = "radio://0/80/2M/E7E7E7E7E9"
 URI_2 = "radio://0/80/2M/E7E7E7E7E7"
 
-
-# ------------------------------------------------------------
-# MOTIVE
-# ------------------------------------------------------------
-
+# motive ids
 MOTIVE_ID_1 = 2
 MOTIVE_ID_2 = 3
 
 
-# ------------------------------------------------------------
-# FLIGHT
-# ------------------------------------------------------------
-
+# fligth parameters
 FLIGHT_HEIGHT = 0.5
 
 # Velocity at which each drone tries to reach the
@@ -102,18 +92,7 @@ MAX_SPEED = 0.07
 # Control period: 20 Hz
 DT = 0.05
 
-
-# ------------------------------------------------------------
-# ORCA
-# ------------------------------------------------------------
-
-# Radius assigned to EACH Crazyflie.
-#
-# orca_lib uses:
-#
-#       combined_radius = 2 * RADIUS
-#
-# therefore RADIUS=0.20 means a combined ORCA radius of 0.40 m.
+# orca radius
 RADIUS = 0.20
 
 # Prediction horizon
@@ -133,7 +112,7 @@ GOAL_TOLERANCE = 0.12
 
 # Hard emergency stop.
 # This is independent of ORCA.
-EMERGENCY_DISTANCE = 0.25
+EMERGENCY_DISTANCE = 0.50
 
 # Maximum horizontal displacement from the starting point.
 MAX_DISTANCE_FROM_START = 1.20
@@ -206,25 +185,17 @@ def motive_to_cf_velocity(v_motive):
 # ============================================================
 
 def distance_2d(a, b):
-    """
-    Euclidean distance in Motive X-Z plane.
-    """
+    # euclidean distance in Motive X-Z plane.
 
     dx = b[0] - a[0]
     dz = b[1] - a[1]
 
-    return math.sqrt(
-        dx * dx +
-        dz * dz
-    )
+    return math.sqrt(dx * dx + dz * dz)
 
 
 def vector_norm(v):
 
-    return math.sqrt(
-        v[0] * v[0] +
-        v[1] * v[1]
-    )
+    return math.sqrt(v[0] * v[0] + v[1] * v[1])
 
 
 # ============================================================
@@ -851,70 +822,26 @@ def main():
     tracker = None
     csv_file = None
 
-
     try:
 
-        # ====================================================
-        # MOTIVE
-        # ====================================================
-
         tracker = create_tracker()
-
-
-        # ====================================================
-        # CSV
-        # ====================================================
 
         csv_file, csv_writer = (
             create_csv()
         )
 
+        with open(os.devnull, "w") as devnull:
 
-        # ====================================================
-        # CFLIB DRIVERS
-        #
-        # Redirect stderr ONLY during driver initialization.
-        # This suppresses low-level invasive driver messages.
-        # ====================================================
-
-        with open(
-            os.devnull,
-            "w"
-        ) as devnull:
-
-            with contextlib.redirect_stderr(
-                devnull
-            ):
-
-                cflib.crtp.init_drivers(
-                    enable_debug_driver=False
-                )
-
-
-        # ====================================================
-        # CF1
-        # ====================================================
+            with contextlib.redirect_stderr(devnull):
+                cflib.crtp.init_drivers(enable_debug_driver=False)
 
         print("Connecting CF1...")
 
-
-        with SyncCrazyflie(
-            URI_1,
-            cf=Crazyflie(
-                rw_cache="./cache"
-            )
-        ) as scf1:
-
+        with SyncCrazyflie(URI_1, cf = Crazyflie(rw_cache="./cache")) as scf1:
 
             print("CF1 connected.")
-
-
-            # =================================================
-            # CF2
-            # =================================================
-
+            
             print("Connecting CF2...")
-
 
             with SyncCrazyflie(
                 URI_2,
@@ -926,10 +853,17 @@ def main():
 
                 print("CF2 connected.")
 
+                # Leggiamo le posizioni dei droni a terra
+                ground_positions = read_two_drones(tracker)
 
-                # =============================================
-                # TAKEOFF
-                # =============================================
+                if ground_positions is None:
+                    raise RuntimeError("Motive non rileva entrambi i droni a terra")
+
+                ground1_3d, ground2_3d = ground_positions
+
+                print("Posizioni a terra acquisite")
+                print("CF1:", ground1_3d)
+                print("CF2:", ground2_3d)
 
                 print("Taking off...")
 
@@ -947,8 +881,7 @@ def main():
 
 
                         print(
-                            "Both drones airborne."
-                        )
+                            "Both drones airborne.")
 
 
                         # =====================================
@@ -1425,6 +1358,11 @@ def main():
                                 )
                             )
 
+                            print(
+                                f"\nCF1: pref={v_pref1}, ORCA={v_safe1}"
+                                f"\nCF2: pref={v_pref2}, ORCA={v_safe2}"
+                            )
+
 
                             # =================================
                             # MOTIVE -> CRAZYFLIE
@@ -1573,147 +1511,47 @@ def main():
                                 flush=True
                             )
 
-
-                            # =================================
-                            # CONTROL PERIOD
-                            # =================================
-
-                            loop_time = (
-                                time.monotonic()
-                                - loop_start
-                            )
-
-
-                            sleep_time = (
-                                DT -
-                                loop_time
-                            )
-
+                            loop_time = (time.monotonic() - loop_start)
+                            sleep_time = (DT - loop_time)
 
                             if sleep_time > 0:
+                                time.sleep(sleep_time)
 
-                                time.sleep(
-                                    sleep_time
-                                )
-
-
-                        # =====================================
-                        # STOP BEFORE LANDING
-                        # =====================================
-
-                        print()
-                        print(
-                            "Stopping both drones..."
-                        )
-
+                        print("\nStopping both drones...")
 
                         for _ in range(20):
 
-                            send_zero_velocity(
-                                scf1.cf
-                            )
+                            send_zero_velocity(scf1.cf)
+                            send_zero_velocity(scf2.cf)
 
-                            send_zero_velocity(
-                                scf2.cf
-                            )
-
-                            time.sleep(
-                                0.05
-                            )
-
-
-                        print(
-                            "Landing..."
-                        )
-
-
-                print(
-                    "Both drones landed."
-                )
-
-
-        print(
-            "Radio connections closed."
-        )
-
-
-    # ========================================================
-    # CTRL+C
-    # ========================================================
+                            time.sleep(0.05)
+                        print("Landing...")
+                print("both drones landed")
+        print("radio connections closed")
 
     except KeyboardInterrupt:
+        print("CTRL+C")
 
-        print()
-        print()
-        print(
-            "CTRL+C received."
-        )
-
-        print(
-            "Stopping experiment and closing connections."
-        )
-
-
-    # ========================================================
-    # REAL ERRORS ARE NOT HIDDEN
-    # ========================================================
+        print("Stopping experiment and closing connections")
 
     except Exception as e:
-
-        print()
-        print(
-            f"ERROR: {type(e).__name__}: {e}"
-        )
-
-
-    # ========================================================
-    # CLEANUP
-    # ========================================================
+        print(f"\nERROR: {type(e).__name__}: {e}")
 
     finally:
 
-        # ----------------------------------------------------
-        # CSV
-        # ----------------------------------------------------
-
+        # csv
         if csv_file is not None:
-
             try:
-
                 csv_file.close()
-
             except Exception:
-
                 pass
-
-
-        # ----------------------------------------------------
-        # NATNET
-        # ----------------------------------------------------
-
+        # natnet
         if tracker is not None:
-
             try:
-
                 tracker.close()
-
-                print(
-                    "NatNet closed."
-                )
-
+                print("natnet closed")
             except Exception:
-
                 pass
-
-
-        print(
-            "Program terminated."
-        )
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     main()
