@@ -1,0 +1,561 @@
+import warnings
+import os
+
+warnings.filterwarnings("ignore")
+warnings.simplefilter("ignore")
+os.environ["PYTHONWARNINGS"] = "ignore"
+
+import sys
+import logging
+import contextlib
+
+for logger_name in [
+    "cflib",
+    "cflib.crtp",
+    "cflib.crazyflie",
+    "cflib.crazyflie.log",
+    "cflib.crazyflie.syncCrazyflie",
+]:
+    logger = logging.getLogger(logger_name)
+    logger.handlers.clear()
+    logger.propagate = False
+    logger.disabled = True
+    logger.setLevel(logging.CRITICAL + 1)
+
+
+import time
+import math
+import cflib.crtp
+from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+from natnet_tracker import NatNetTracker
+from orca_lib import compute_orca_constraint, choose_orca_velocity
+
+
+# drones addresses
+URI_1 = "radio://0/80/2M/E7E7E7E7E9"
+URI_2 = "radio://0/80/2M/E7E7E7E7E7"
+
+# motive ids
+MOTIVE_ID_1 = 2
+MOTIVE_ID_2 = 3
+
+# fligth parameters
+FLIGHT_HEIGHT = 0.8
+TAKEOFF_TIME = 3.0
+LANDING_TIME = 3.0
+COMMAND_DURATION = 0.25
+
+# Velocity at which each drone tries to reach the
+# initial position of the other drone
+PREFERRED_SPEED = 0.3
+
+# Maximum velocity ORCA is allowed to return
+MAX_SPEED = 0.5
+
+# Control period: 20 Hz
+DT = 0.05
+
+# orca radius
+RADIUS = 0.20
+
+# Prediction horizon
+TIME_HORIZON = 3.0
+
+# goal
+GOAL_TOLERANCE = 0.12
+
+# safety
+EMERGENCY_DISTANCE = 0.20
+
+# Maximum horizontal displacement from the starting point
+MAX_DISTANCE_FROM_START = 1.20
+
+# Motive Y is vertical
+MAX_VERTICAL_CHANGE = 0.20
+
+# Maximum experiment duration
+MAX_TEST_TIME = 20.0
+
+# Maximum time waiting for Motive
+MOTIVE_TIMEOUT = 10.0
+
+# Number of samples required before accepting the
+# initial Motive position
+REQUIRED_VALID_SAMPLES = 20
+
+# velocity estimation
+VELOCITY_ALPHA = 0.25
+
+# Reject obviously invalid finite-difference velocities
+MAX_VALID_MOTIVE_SPEED = 2.0
+
+
+# ============================================================
+# MOTIVE -> CRAZYFLIE TRANSFORMATION
+# ============================================================
+
+def motive_to_cf_velocity(v_motive):
+    """
+    Convert a horizontal velocity expressed in Motive X-Z
+    coordinates into Crazyflie world X-Y coordinates.
+
+    Experimental calibration:
+        +X_CF  ->  -Z_Motive
+        +Y_CF  ->  -X_Motive
+
+    Therefore:
+        vx_CF = -vz_Motive
+        vy_CF = -vx_Motive
+
+    ORCA always works in Motive X-Z.
+    This transformation is applied ONLY immediately before
+    sending the velocity to the Crazyflie.
+    """
+    vx_motive, vz_motive = v_motive
+    vx_cf = -vz_motive
+    vy_cf = -vx_motive
+    return vx_cf, vy_cf
+
+
+# vector operations
+def distance_2d(a, b):
+    # euclidean distance in Motive X-Z plane.
+    dx = b[0] - a[0]
+    dz = b[1] - a[1]
+    return math.sqrt(dx * dx + dz * dz)
+
+def vector_norm(v):
+    return math.sqrt(v[0] * v[0] + v[1] * v[1])
+
+
+# navigation
+def velocity_toward_goal(position, goal, speed):
+    """
+    Compute preferred velocity toward the goal.
+    Everything is expressed in Motive X-Z.
+
+    TODO: da scrivere negli appunti/report
+                 goal - position
+    v_pref = V -------------------
+                ||goal-position||
+    """
+    dx = goal[0] - position[0]
+    dz = goal[1] - position[1]
+    distance = math.sqrt(dx * dx + dz * dz)
+
+    if distance < GOAL_TOLERANCE:
+        return (0.0, 0.0)
+
+    return (speed * dx / distance, speed * dz / distance)
+
+
+class VelocityEstimator:
+
+    def __init__(self, alpha=0.25):
+        self.alpha = alpha
+        self.previous_position = None
+        self.previous_time = None
+        self.velocity = (0.0, 0.0, 0.0)
+
+    def reset(self, position):
+        self.previous_position = position
+        self.previous_time = time.monotonic()
+        self.velocity = (0.0, 0.0, 0.0)
+
+    def update(self, position):
+        now = time.monotonic()
+
+        if self.previous_position is None:
+            self.reset(position)
+            return self.velocity
+
+        dt = now - self.previous_time
+        if dt <= 0.0:
+            return self.velocity
+
+        px, py, pz = self.previous_position
+        x, y, z = position
+
+        # finite difference
+        raw_vx = (x - px) / dt
+        raw_vy = (y - py) / dt
+        raw_vz = (z - pz) / dt
+
+        raw_speed = math.sqrt(raw_vx ** 2 + raw_vy ** 2 + raw_vz ** 2)
+
+        # reject invalid spikes
+        if raw_speed <= MAX_VALID_MOTIVE_SPEED:
+            a = self.alpha
+            old_vx, old_vy, old_vz = self.velocity
+
+            # EMA filter
+            self.velocity = (
+                a * raw_vx + (1.0 - a) * old_vx,
+                a * raw_vy + (1.0 - a) * old_vy,
+                a * raw_vz + (1.0 - a) * old_vz,
+            )
+
+        self.previous_position = position
+        self.previous_time = now
+        return self.velocity
+
+
+# Motive
+def create_tracker():
+    tracker = NatNetTracker(
+        server_ip="127.0.0.1",
+        local_ip="127.0.0.1",
+        use_multicast=False,
+    )
+    tracker.connect()
+    print("Motive connected.")
+    return tracker
+
+
+def read_two_drones(tracker):
+    """
+    natnet update, then read both rigid bodies
+    Motive:
+        X, Y (vertical), Z
+    """
+    tracker.update()
+    info1 = tracker.get_info_by_id(MOTIVE_ID_1)
+    info2 = tracker.get_info_by_id(MOTIVE_ID_2)
+
+    if (info1 is None or info2 is None):
+        return None
+
+    return (info1["position"], info2["position"])
+
+
+# commands
+def send_motive_velocity(cf, v_motive):
+    vx_cf, vy_cf = motive_to_cf_velocity(v_motive)
+    print("sending this velocities from motive to crazyflies:")
+    print(f"x_velocity: {vx_cf}")
+    print(f"y_velocity: {vy_cf}")
+    cf.high_level_commander.go_to(x=vx_cf * COMMAND_DURATION,y=vy_cf * COMMAND_DURATION,z=0.0,yaw=0.0,duration_s=COMMAND_DURATION,relative=True)
+    return (vx_cf, vy_cf)
+
+
+def arm(cf):
+    cf.supervisor.send_arming_request(True)
+    time.sleep(1.0)
+
+
+def take_off(cf):
+    cf.high_level_commander.takeoff(absolute_height_m=FLIGHT_HEIGHT,duration_s=TAKEOFF_TIME,yaw=None)
+
+
+def land(cf):
+    cf.high_level_commander.land(absolute_height_m=0.0,duration_s=LANDING_TIME,yaw=None)
+
+
+def wait_for_two_drones(tracker):
+    print("waiting for both Motive rigid bodies...")
+    valid_samples = []
+    start_time = time.monotonic()
+
+    while (time.monotonic() - start_time < MOTIVE_TIMEOUT):
+
+        positions = read_two_drones(tracker)
+        if positions is None:
+            valid_samples = []
+            time.sleep(DT)
+            continue
+
+        p1, p2 = positions
+        valid_samples.append((p1, p2))
+
+        if len(valid_samples) >= REQUIRED_VALID_SAMPLES:
+            # average initial position CF1
+            p1_avg = (
+                sum(sample[0][0] for sample in valid_samples) / len(valid_samples),
+                sum(sample[0][1] for sample in valid_samples) / len(valid_samples),
+                sum(sample[0][2] for sample in valid_samples) / len(valid_samples),
+            )
+
+            # average initial position CF2
+            p2_avg = (
+                sum(sample[1][0] for sample in valid_samples) / len(valid_samples),
+                sum(sample[1][1] for sample in valid_samples) / len(valid_samples),
+                sum(sample[1][2] for sample in valid_samples) / len(valid_samples),
+            )
+
+            print("Both drones acquired by Motive.")
+            return (p1_avg, p2_avg)
+
+        time.sleep(DT)
+
+    return None
+
+
+# orca
+def calculate_orca_velocity(position, velocity, other_position, other_velocity, preferred_velocity):
+    """
+    Calculate one ORCA constraint and select the safe velocity.
+    ALL quantities in this function are expressed in
+    Motive X-Z coordinates.
+    """
+    # --------------------------------------------------------
+    # ORCA HALF-PLANE
+    # --------------------------------------------------------
+    line_point, line_direction, u = compute_orca_constraint(
+        position, velocity, other_position, other_velocity, RADIUS, TIME_HORIZON, DT
+    )
+
+    # --------------------------------------------------------
+    # SELECT VELOCITY CLOSEST TO v_pref
+    # --------------------------------------------------------
+    safe_velocity = choose_orca_velocity(
+        preferred_velocity, line_point, line_direction, MAX_SPEED
+    )
+
+    return (safe_velocity, u)
+
+
+def check_safety(p1_3d, p2_3d, start1_3d, start2_3d):
+    x1, y1, z1 = p1_3d
+    x2, y2, z2 = p2_3d
+    sx1, sy1, sz1 = start1_3d
+    sx2, sy2, sz2 = start2_3d
+
+    # --------------------------------------------------------
+    # 1. INTER-DRONE DISTANCE
+    # --------------------------------------------------------
+    separation = distance_2d((x1, z1), (x2, z2))
+    if separation < EMERGENCY_DISTANCE:
+        return (False, f"EMERGENCY DISTANCE: {separation:.3f} m")
+
+    # --------------------------------------------------------
+    # 2. VERTICAL MOTION
+    # Motive Y is vertical.
+    # --------------------------------------------------------
+    vertical_change_1 = abs(y1 - sy1)
+    vertical_change_2 = abs(y2 - sy2)
+
+    if vertical_change_1 > MAX_VERTICAL_CHANGE:
+        return (False, f"CF1 abnormal vertical change: {vertical_change_1:.3f} m")
+
+    if vertical_change_2 > MAX_VERTICAL_CHANGE:
+        return (False, f"CF2 abnormal vertical change: {vertical_change_2:.3f} m")
+
+    # --------------------------------------------------------
+    # 3. GEOFENCE
+    # --------------------------------------------------------
+    dist_start_1 = distance_2d((x1, z1), (sx1, sz1))
+    dist_start_2 = distance_2d((x2, z2), (sx2, sz2))
+
+    if dist_start_1 > MAX_DISTANCE_FROM_START:
+        return (False, "CF1 left allowed area")
+
+    if dist_start_2 > MAX_DISTANCE_FROM_START:
+        return (False, "CF2 left allowed area")
+
+    return (True, "OK")
+
+
+def main():
+    tracker = None
+    flight_started = False
+
+    try:
+        tracker = create_tracker()
+
+        with open(os.devnull, "w") as devnull:
+            with contextlib.redirect_stderr(devnull):
+                cflib.crtp.init_drivers(enable_debug_driver=False)
+
+        print("Connecting CF1...")
+        with SyncCrazyflie(URI_1, cf=Crazyflie(rw_cache="./cache")) as scf1:
+            print("CF1 connected")
+            print("Connecting CF2...")
+
+            with SyncCrazyflie(URI_2, cf=Crazyflie(rw_cache="./cache")) as scf2:
+                print("CF2 connected")
+
+                ground_positions = read_two_drones(tracker)
+                if ground_positions is None:
+                    raise RuntimeError("Motive non rileva entrambi i droni a terra")
+
+                ground1_3d, ground2_3d = ground_positions
+                print("ground positions:")
+                print(f"CF1 {URI_1}:", ground1_3d)
+                print(f"CF2 {URI_2}:", ground2_3d)
+                print("taking off...")
+
+                arm(scf1.cf)
+                arm(scf2.cf)
+                flight_started = True
+                try:
+                    take_off(scf1.cf)
+                    take_off(scf2.cf)
+                    time.sleep(TAKEOFF_TIME + 0.5)
+                    print("both drones in air")
+
+                    # motive acquisition
+                    acquired = wait_for_two_drones(tracker)
+                    if acquired is None:
+                        print("ERROR: Motive acquisition failed")
+                        return
+
+                    start1_3d, start2_3d = acquired
+
+                    print("initial motive positions")
+                    print(f"CF1: X={start1_3d[0]:+.3f} Y={start1_3d[1]:+.3f} Z={start1_3d[2]:+.3f}")
+                    print(f"CF2: X={start2_3d[0]:+.3f} Y={start2_3d[1]:+.3f} Z={start2_3d[2]:+.3f}\n")
+
+                    # =====================================
+                    # ORCA PLANE = MOTIVE X-Z
+                    # =====================================
+                    start1 = (start1_3d[0], start1_3d[2])
+                    start2 = (start2_3d[0], start2_3d[2])
+                    initial_separation = distance_2d(start1, start2)
+                    print(f"Initial horizontal separation: {initial_separation:.3f} m\n")
+
+                    # swap goals
+                    goal1 = start2
+                    goal2 = start1
+
+                    print(f"CF1 goal: ({goal1[0]:+.3f}, {goal1[1]:+.3f})")
+                    print(f"CF2 goal: ({goal2[0]:+.3f}, {goal2[1]:+.3f})\n")
+
+                    estimator1 = VelocityEstimator(VELOCITY_ALPHA)
+                    estimator2 = VelocityEstimator(VELOCITY_ALPHA)
+                    estimator1.reset(start1_3d)
+                    estimator2.reset(start2_3d)
+
+                    print("stabilizing for 2 seconds...")
+                    hover_start = time.monotonic()
+
+                    while (time.monotonic() - hover_start < 2.0):
+                        tracker.update()
+                        time.sleep(DT)
+
+                    # last position check
+                    positions = read_two_drones(tracker)
+                    if positions is None:
+                        print("ERROR: Tracking lost before ORCA")
+                        return
+
+                    p1_3d, p2_3d = positions
+                    estimator1.reset(p1_3d)
+                    estimator2.reset(p2_3d)
+
+                    # orca control loop
+                    test_start = time.monotonic()
+
+                    while True:
+                        loop_start = time.monotonic()
+
+                        # time
+                        elapsed = loop_start - test_start
+                        if elapsed > MAX_TEST_TIME:
+                            print()
+                            print("Test timeout")
+                            break
+
+                        # motive
+                        positions = read_two_drones(tracker)
+                        if positions is None:
+                            print()
+                            print("SAFETY STOP: Motive tracking lost")
+                            break
+
+                        p1_3d, p2_3d = positions
+
+                        safe, reason = check_safety(p1_3d, p2_3d, start1_3d, start2_3d)
+                        if not safe:
+                            print(f"SAFETY STOP: {reason}")
+                            break
+
+                        # positions in orca frame
+                        p1 = (p1_3d[0], p1_3d[2])
+                        p2 = (p2_3d[0], p2_3d[2])
+
+                        # measured velocities
+                        vel1_3d = estimator1.update(p1_3d)
+                        vel2_3d = estimator2.update(p2_3d)
+                        v1 = (vel1_3d[0], vel1_3d[2])
+                        v2 = (vel2_3d[0], vel2_3d[2])
+
+                        # preferred velocites
+                        v_pref1 = velocity_toward_goal(p1, goal1, PREFERRED_SPEED)
+                        v_pref2 = velocity_toward_goal(p2, goal2, PREFERRED_SPEED)
+
+                        # goal distances
+                        d_goal1 = distance_2d(p1, goal1)
+                        d_goal2 = distance_2d(p2, goal2)
+
+                        if d_goal1 < GOAL_TOLERANCE and d_goal2 < GOAL_TOLERANCE:
+                            print()
+                            print("both goals reached")
+                            break
+
+                        v_safe1, u1 = calculate_orca_velocity(p1, v1, p2, v2, v_pref1)
+                        v_safe2, u2 = calculate_orca_velocity(p2, v2, p1, v1, v_pref2)
+
+                        print(
+                            f"\nCF1: pref={v_pref1}, ORCA={v_safe1}"
+                            f"\nCF2: pref={v_pref2}, ORCA={v_safe2}"
+                        )
+
+                        cmd1_vx, cmd1_vy = send_motive_velocity(scf1.cf, v_safe1)
+                        cmd2_vx, cmd2_vy = send_motive_velocity(scf2.cf, v_safe2)
+
+                        separation = distance_2d(p1, p2)
+
+                        # orca corrections
+                        u1_norm = vector_norm(u1)
+                        u2_norm = vector_norm(u2)
+
+                        # pref = desired velocity
+                        # safe = ORCA velocity
+                        # |u|  = ORCA correction
+                        print(
+                            f"\rt={elapsed:5.1f}s | d={separation:.3f}m | "
+                            f"CF1 pref=({v_pref1[0]:+.3f},{v_pref1[1]:+.3f}) "
+                            f"safe=({v_safe1[0]:+.3f},{v_safe1[1]:+.3f}) |u|={u1_norm:.3f} | "
+                            f"CF2 pref=({v_pref2[0]:+.3f},{v_pref2[1]:+.3f}) "
+                            f"safe=({v_safe2[0]:+.3f},{v_safe2[1]:+.3f}) |u|={u2_norm:.3f}",
+                            end="",
+                            flush=True,
+                        )
+
+                        loop_time = time.monotonic() - loop_start
+                        sleep_time = DT - loop_time
+                        if sleep_time > 0:
+                            time.sleep(sleep_time)
+
+                    print("\nStopping both drones...")
+
+                finally:
+                    if flight_started:
+                        print("Landing...")
+                        land(scf1.cf)
+                        land(scf2.cf)
+                        time.sleep(LANDING_TIME + 0.5)
+                        scf1.cf.high_level_commander.stop()
+                        scf2.cf.high_level_commander.stop()
+                print("both drones landed")
+        print("radio connections closed")
+
+    except KeyboardInterrupt:
+        print("CTRL+C")
+        print("Stopping experiment and closing connections")
+
+    except Exception as e:
+        print(f"\nERROR: {type(e).__name__}: {e}")
+
+    finally:
+        # natnet
+        if tracker is not None:
+            try:
+                tracker.close()
+                print("natnet closed")
+            except Exception:
+                pass
+
+if __name__ == "__main__":
+    main()

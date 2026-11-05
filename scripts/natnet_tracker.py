@@ -1,21 +1,28 @@
+import math
 import threading
-from typing import Optional
+import time
 
+from typing import Optional
 from natnet import DataDescriptions, DataFrame, NatNetClient
 
 
 class NatNetTracker:
     """
-    Wrapper around the NatNet client.
+    Riceve i frame NatNet e conserva uno snapshot
+    atomico dei Rigid Bodies.
 
-    Stores the latest state received for each rigid body.
+    Permette di controllare:
+    - arrivo di nuovi frame;
+    - momento dell'ultimo frame ricevuto;
+    - tracking valido per ogni Rigid Body;
+    - ultima ricezione valida per ogni Rigid Body.
     """
 
     def __init__(
         self,
-        server_ip: str = "127.0.0.1",
-        local_ip: str = "127.0.0.1",
-        use_multicast: bool = False,
+        server_ip="127.0.0.1",
+        local_ip="127.0.0.1",
+        use_multicast=False,
     ):
         self.server_ip = server_ip
         self.local_ip = local_ip
@@ -27,23 +34,18 @@ class NatNetTracker:
             use_multicast=use_multicast,
         )
 
-        # Store the latest data received for each rigid body.
-        # The key is the rigid body ID.
         self._rigid_bodies = {}
-
-        # Store the latest data descriptions received from the server.
         self._data_descriptions = None
 
-        # Total number of frames received.
         self._num_frames = 0
+        self._last_frame_time = None
 
-        # Protect shared data when using asynchronous mode.
+        self._last_valid_at = {}
+        self._last_tracking_flags = {}
+
         self._lock = threading.Lock()
-
-        # Event used to detect when the first frame is received.
         self._first_frame_event = threading.Event()
 
-        # Register NatNet callbacks.
         self.client.on_data_frame_received_event.handlers.append(
             self._on_frame_received
         )
@@ -52,242 +54,248 @@ class NatNetTracker:
             self._on_description_received
         )
 
-    # ------------------------------------------------------------------
-    # NATNET CALLBACKS
-    # ------------------------------------------------------------------
+    # --------------------------------------------------
+    # VALIDITA' TRACKING
+    # --------------------------------------------------
+
+    @staticmethod
+    def _tracking_valid(rb):
+        """
+        True  = Rigid Body tracciato
+        False = tracking non valido
+        None  = libreria non espone il flag
+
+        Non consideriamo mai None equivalente a True.
+        """
+
+        for attr in ("tracking_valid", "is_tracking_valid"):
+            flag = getattr(rb, attr, None)
+
+            if callable(flag):
+                flag = flag()
+
+            if isinstance(flag, bool):
+                return flag
+
+        # Alcune implementazioni conservano il flag
+        # nel bit 0 del campo params.
+        params = getattr(rb, "params", None)
+
+        if isinstance(params, int):
+            return bool(params & 1)
+
+        return None
+
+    # --------------------------------------------------
+    # CALLBACK NATNET
+    # --------------------------------------------------
 
     def _on_frame_received(self, data_frame: DataFrame):
         """
-        Called automatically whenever a new NatNet frame is received.
+        Viene eseguito quando arriva un nuovo frame.
+
+        Il timestamp viene aggiornato qui, NON quando
+        lo script richiede una posizione memorizzata.
         """
+
+        now = time.monotonic()
+
+        bodies = {
+            rb.id_num: rb
+            for rb in data_frame.rigid_bodies
+        }
+
+        flags = {
+            rb_id: self._tracking_valid(rb)
+            for rb_id, rb in bodies.items()
+        }
 
         with self._lock:
             self._num_frames += 1
+            self._last_frame_time = now
 
-            self._rigid_bodies = {
-                rigid_body.id_num: rigid_body
-                for rigid_body in data_frame.rigid_bodies
-            }
+            # Sostituiamo l'intero contenuto.
+            # Un RB scomparso non conserva il vecchio dato.
+            self._rigid_bodies = bodies
+            self._last_tracking_flags = flags
+
+            for rb_id, rb in bodies.items():
+                if flags[rb_id] is not True:
+                    continue
+
+                try:
+                    pos = tuple(float(v) for v in rb.pos)
+                except (ValueError, TypeError):
+                    continue
+
+                if (
+                    len(pos) == 3
+                    and all(math.isfinite(v) for v in pos)
+                ):
+                    self._last_valid_at[rb_id] = now
 
             self._first_frame_event.set()
 
-    def _on_description_received(self, desc: DataDescriptions):
-        """
-        Called when the server sends the model/data descriptions.
-        """
-
+    def _on_description_received(
+        self,
+        desc: DataDescriptions,
+    ):
         with self._lock:
             self._data_descriptions = desc
 
-    # ------------------------------------------------------------------
+    # --------------------------------------------------
     # CONNECTION
-    # ------------------------------------------------------------------
+    # --------------------------------------------------
 
     def connect(self):
-        """
-        Connect to the NatNet server.
-
-        Also requests the model definitions from the server.
-        """
-
         self.client.connect()
-
-        # Request information about the available models/rigid bodies.
         self.client.request_modeldef()
 
     def start_async(self):
         """
-        Start receiving NatNet data asynchronously.
+        Avvia la ricezione NatNet indipendentemente
+        dal ciclo di controllo principale.
 
-        The NatNet client will handle incoming frames in the background.
+        Dopo start_async() non chiamare update().
         """
-
         self.client.run_async()
 
     def update(self):
-        """
-        Process incoming NatNet data in synchronous mode.
-
-        This method should be called periodically from the main loop.
-        """
-
         self.client.update_sync()
 
     def close(self):
-        """
-        Close the NatNet connection.
-        """
-
         self.client.shutdown()
 
-    # ------------------------------------------------------------------
-    # GENERAL INFORMATION
-    # ------------------------------------------------------------------
+    # --------------------------------------------------
+    # FRAME INFORMATION
+    # --------------------------------------------------
 
     @property
-    def num_frames(self) -> int:
-        """
-        Return the total number of frames received.
-        """
-
+    def num_frames(self):
         with self._lock:
             return self._num_frames
 
-    def wait_for_first_frame(self, timeout: Optional[float] = None) -> bool:
-        """
-        Wait until the first frame is received.
-
-        Args:
-            timeout: Maximum time to wait in seconds.
-                     None means wait indefinitely.
-
-        Returns:
-            True if a frame was received.
-            False if the timeout expired.
-        """
-
+    def wait_for_first_frame(
+        self,
+        timeout: Optional[float] = None,
+    ):
         return self._first_frame_event.wait(timeout)
 
-    # ------------------------------------------------------------------
-    # RIGID BODY
-    # ------------------------------------------------------------------
-
-    def get_rigid_body(self, id_num: int):
+    def get_tracking_snapshot(self, ids):
         """
-        Return the latest rigid body data for the given ID.
+        Restituisce dati coerenti dello stesso frame.
 
-        Args:
-            id_num: Rigid body ID.
+        Per ogni RB:
+        - position
+        - tracked
+        - rb_type
 
-        Returns:
-            The latest RigidBody object, or None if the rigid body
-            has never been received.
+        Restituisce anche:
+        - frame
+        - received_at
+        - last_valid_at
         """
 
+        with self._lock:
+            result = {}
+
+            for rb_id in ids:
+                rb = self._rigid_bodies.get(rb_id)
+
+                if rb is None:
+                    result[rb_id] = None
+                    continue
+
+                try:
+                    position = tuple(
+                        float(v) for v in rb.pos
+                    )
+
+                    if (
+                        len(position) != 3
+                        or not all(
+                            math.isfinite(v)
+                            for v in position
+                        )
+                    ):
+                        position = None
+
+                except (ValueError, TypeError):
+                    position = None
+
+                result[rb_id] = {
+                    "position": position,
+                    "tracked": self._last_tracking_flags.get(
+                        rb_id
+                    ),
+                    "rb_type": type(rb).__name__,
+                }
+
+            return {
+                "frame": self._num_frames,
+                "received_at": self._last_frame_time,
+                "bodies": result,
+                "last_valid_at": {
+                    rb_id: self._last_valid_at.get(rb_id)
+                    for rb_id in ids
+                },
+            }
+
+    # --------------------------------------------------
+    # COMPATIBILITA' CON IL VECCHIO TRACKER
+    # --------------------------------------------------
+
+    def get_rigid_body(self, id_num):
         with self._lock:
             return self._rigid_bodies.get(id_num)
 
-    def get_info_by_id(self, id_num: int):
-        """
-        Return the main information for a rigid body.
+    def get_info_by_id(self, id_num):
+        rb = self.get_rigid_body(id_num)
 
-        Args:
-            id_num: Rigid body ID.
-
-        Returns:
-            A dictionary containing the ID, position and orientation,
-            or None if the rigid body has never been received.
-        """
-
-        rigid_body = self.get_rigid_body(id_num)
-
-        if rigid_body is None:
+        if rb is None:
             return None
 
         return {
-            "id": rigid_body.id_num,
-            "position": rigid_body.pos,
-            "orientation": rigid_body.rot,
+            "id": rb.id_num,
+            "position": rb.pos,
+            "orientation": rb.rot,
         }
 
-    def get_position(self, id_num: int):
-        """
-        Return the latest position of a rigid body.
+    def get_position(self, id_num):
+        rb = self.get_rigid_body(id_num)
+        return None if rb is None else rb.pos
 
-        Args:
-            id_num: Rigid body ID.
+    def get_orientation(self, id_num):
+        rb = self.get_rigid_body(id_num)
+        return None if rb is None else rb.rot
 
-        Returns:
-            Position as (x, y, z), or None if the rigid body
-            has never been received.
-        """
-
-        rigid_body = self.get_rigid_body(id_num)
-
-        if rigid_body is None:
-            return None
-
-        return rigid_body.pos
-
-    def get_orientation(self, id_num: int):
-        """
-        Return the latest orientation of a rigid body.
-
-        The orientation is represented as a quaternion.
-
-        Args:
-            id_num: Rigid body ID.
-
-        Returns:
-            Quaternion as (x, y, z, w), or None if the rigid body
-            has never been received.
-        """
-
-        rigid_body = self.get_rigid_body(id_num)
-
-        if rigid_body is None:
-            return None
-
-        return rigid_body.rot
-
-    def rigid_body_exists(self, id_num: int) -> bool:
-        """
-        Check whether a rigid body with the given ID has been received.
-        """
-
+    def rigid_body_exists(self, id_num):
         with self._lock:
             return id_num in self._rigid_bodies
 
-    def get_all_rigid_bodies(self) -> dict:
-        """
-        Return all rigid bodies currently stored.
-
-        Returns:
-            A dictionary in the form:
-            {id: rigid_body}
-        """
-
+    def get_all_rigid_bodies(self):
         with self._lock:
             return self._rigid_bodies.copy()
 
-    def get_all_info(self) -> dict:
-        """
-        Return the main information for all currently tracked rigid bodies.
-
-        Returns:
-            A dictionary in the form:
-
-            {
-                id: {
-                    "id": ...,
-                    "position": ...,
-                    "orientation": ...
-                }
-            }
-        """
-
+    def get_all_info(self):
         with self._lock:
             return {
-                id_num: {
-                    "id": rigid_body.id_num,
-                    "position": rigid_body.pos,
-                    "orientation": rigid_body.rot,
+                rb_id: {
+                    "id": rb.id_num,
+                    "position": rb.pos,
+                    "orientation": rb.rot,
                 }
-                for id_num, rigid_body in self._rigid_bodies.items()
+                for rb_id, rb in self._rigid_bodies.items()
             }
 
-
     def __enter__(self):
-        """
-        Connect to NatNet when entering a context manager.
-        """
-
         self.connect()
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback):
-        """
-        Close the NatNet connection when leaving a context manager.
-        """
-
+    def __exit__(
+        self,
+        exc_type,
+        exc_value,
+        traceback,
+    ):
         self.close()
