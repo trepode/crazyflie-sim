@@ -1,12 +1,15 @@
 """
-Three CrazySim/Gazebo SITL Crazyflies.
+N CrazySim/Gazebo SITL Crazyflies (N >= 3).
 
-Three nominal straight trajectories intersect at one crossing point.
+All nominal straight trajectories intersect at one crossing point.
 
-Expected launch layout (three drones only):
-CF1 = (0, 0), CF2 = (1, 0), CF3 = (0, 1).
-Their goal positions are (1, 1), (0, 1), (1, 0).
-The measured starting positions, not hard-coded coordinates, define the goals.
+The nominal segment for each drone goes from its measured initial XY
+position to its reflection across the common crossing point, defined as
+the center of the XY bounding box of all observed start positions.
+
+In auto mode the script tries consecutive CrazySim UDP URIs starting at
+19850, stopping at the first URI that cannot establish a CFLib connection.
+The --num-drones option provides a deterministic fallback if needed.
 
 Strategies:
 - orca
@@ -57,7 +60,8 @@ FLIGHT_HEIGHT = 0.50
 GOAL_TOLERANCE = 0.12
 MAX_TELEMETRY_AGE = 0.40
 MAX_VERTICAL_CHANGE = 0.20
-N_DRONES = 3
+MIN_DRONES = 3
+MAX_AUTO_DRONES = 12
 
 
 # --------------------------------------------------
@@ -263,7 +267,7 @@ class Telemetry:
         self.latest = None
         self.received_at = 0.0
 
-        self.config = LogConfig(name=f'Gazebo3{name}', period_in_ms=50)
+        self.config = LogConfig(name=f'GazeboN{name}', period_in_ms=50)
 
         for variable in ('x', 'y', 'z', 'vx', 'vy', 'vz'):
             self.config.add_variable('stateEstimate.' + variable, 'float')
@@ -417,7 +421,7 @@ def save_results(output, rows, status):
     if not rows:
         return
 
-    path = output / 'gazebo_orca_3_crossing.csv'
+    path = output / 'gazebo_orca_n_crossing.csv'
 
     with path.open('w', newline='') as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
@@ -442,15 +446,32 @@ def run(args):
     takeoff_done = False
     output = Path(args.output)
 
-    uris = [f'udp://127.0.0.1:{19850 + i}' for i in range(N_DRONES)]
-
     with contextlib.ExitStack() as stack:
-        scfs = [
-            stack.enter_context(
-                SyncCrazyflie(uri, cf=Crazyflie(rw_cache='./cache'))
-            )
-            for uri in uris
-        ]
+        scfs = []
+        limit = args.num_drones if args.num_drones is not None else args.max_auto_drones
+        for i in range(limit):
+            uri = f'udp://127.0.0.1:{args.base_port + i}'
+            try:
+                scf = stack.enter_context(
+                    SyncCrazyflie(uri, cf=Crazyflie(rw_cache='./cache'))
+                )
+            except Exception as exc:
+                if args.num_drones is not None or i < MIN_DRONES:
+                    raise RuntimeError(f'Unable to connect to CF{i+1} at {uri}: {exc}') from exc
+                print(f'Auto-discovery ended at {uri}: {type(exc).__name__}: {exc}')
+                break
+            scfs.append(scf)
+            print(f'Connected CF{i+1}: {uri}')
+        n_drones = len(scfs)
+        if n_drones < MIN_DRONES:
+            raise RuntimeError(f'Need at least {MIN_DRONES} drones; found {n_drones}')
+        if args.num_drones is None and n_drones == args.max_auto_drones:
+            raise RuntimeError('Auto-discovery reached scan limit; specify --num-drones '
+                               'or increase --max-auto-drones to ensure no drone is omitted')
+        args.speeds = [args.speed] * n_drones
+        if max(args.speeds) > args.max_speed:
+            raise ValueError('--speed must be <= --max-speed')
+        print(f'Detected drones: {n_drones}')
 
         for scf in scfs:
             scf.cf.param.set_value('stabilizer.controller', '1')
@@ -483,7 +504,7 @@ def run(args):
 
             min_initial = min(
                 distance(starts[i], starts[j])
-                for i, j in combinations(range(N_DRONES), 2)
+                for i, j in combinations(range(n_drones), 2)
             )
 
             if min_initial < args.initial_min_separation:
@@ -531,38 +552,46 @@ def run(args):
                 status = 'TAKEOFF_ONLY'
                 return
 
-            # THREE STRAIGHT PATHS THROUGH THE SAME CROSSING POINT.
-            # For the expected right-angle triangle layout, this is the
-            # circumcenter: (starts[1] + starts[2]) / 2.
-            # Reflect each start across the crossing point to define its goal.
+            # COMMON CROSSING POINT: CENTER OF THE INITIAL XY BOUNDING BOX.
+            # Every segment [start_i, goal_i] goes exactly through center.
             states = [tel.read() for tel in telemetry]
             starts = [(s['x'], s['y']) for s in states]
             center = (
-                (starts[1][0] + starts[2][0]) / 2.0,
-                (starts[1][1] + starts[2][1]) / 2.0,
+                (min(p[0] for p in starts) + max(p[0] for p in starts)) / 2.0,
+                (min(p[1] for p in starts) + max(p[1] for p in starts)) / 2.0,
             )
             goals = [
                 (2.0 * center[0] - p[0], 2.0 * center[1] - p[1])
                 for p in starts
             ]
             heights = [s['z'] for s in states]
-            # Require the expected L-shaped square-corner layout so every
-            # drone is equally far from the crossing center. This makes the
-            # nominal collision simultaneous for equal preferred speeds.
             lengths = [distance(p, center) for p in starts]
-            if min(lengths) < 0.05 or max(lengths) - min(lengths) > args.layout_tolerance:
+            if min(lengths) < args.center_min_distance:
                 raise RuntimeError(
-                    'Three-drone layout is not the expected square-corner '
-                    f'configuration (center={center}, distances={lengths}). '
-                    'Use start positions (0,0), (1,0), (0,1).'
+                    f'A drone starts too close to crossing point {center}; '
+                    f'center distances={lengths}. Change Gazebo layout.'
                 )
+            # The crossing geometry is exact, but equally timed arrivals
+            # require equal start-to-center distances and equal speeds.
+            if max(lengths) - min(lengths) > args.layout_tolerance:
+                print('NOTE: distances to crossing differ: '
+                      f'{[round(d, 3) for d in lengths]} m. '
+                      'Nominal trajectories cross at the same point, '
+                      'but not necessarily at the same time.')
+            # Reject two drones having effectively the same destination.
+            for i, j in combinations(range(n_drones), 2):
+                if distance(goals[i], goals[j]) < args.emergency_distance:
+                    raise RuntimeError(
+                        f'Goals of CF{i+1} and CF{j+1} are closer than '
+                        '--emergency-distance: cannot hold both safely.'
+                    )
 
             detectors = [
                 PairDeadlockDetector(pair, args)
-                for pair in combinations(range(N_DRONES), 2)
+                for pair in combinations(range(n_drones), 2)
             ]
 
-            estimators = [VelocityEstimator() for _ in range(N_DRONES)]
+            estimators = [VelocityEstimator() for _ in range(n_drones)]
 
             for estimator, start in zip(estimators, starts):
                 estimator.reset(start)
@@ -605,7 +634,7 @@ def run(args):
 
                 pair_distances = {
                     (i, j): distance(positions[i], positions[j])
-                    for i, j in combinations(range(N_DRONES), 2)
+                    for i, j in combinations(range(n_drones), 2)
                 }
 
                 min_distance = min(pair_distances.values())
@@ -635,7 +664,7 @@ def run(args):
                 arrived = [
                     errors[i] <= args.goal_tolerance
                     and measured_speeds[i] <= args.arrival_speed
-                    for i in range(N_DRONES)
+                    for i in range(n_drones)
                 ]
 
                 completed = False
@@ -667,36 +696,36 @@ def run(args):
                         args.kp,
                         args.kd
                     )
-                    for i in range(N_DRONES)
+                    for i in range(n_drones)
                 ]
                 
                 # Activate right-bias ONLY when sustained pairwise deadlock
                 # is detected from measured progress and measured speeds.
-                bias = [False] * N_DRONES
+                bias = [False] * n_drones
                 if args.strategy == 'deadlock-right-bias' and not completed:
                     for detector in detectors:
                         if detector.update(t, positions, goals, measured_speeds, starts):
                             i, j = detector.pair
                             bias[i] = True
                             bias[j] = True
-                    for i in range(N_DRONES):
+                    for i in range(n_drones):
                         if bias[i]:
                             preferred[i] = turn_right(preferred[i], args.bias_angle)
 
                 # After the arrival condition has been held long enough,
                 # log the final measured state but stop issuing new velocities.
                 if completed:
-                    safe = [(0.0, 0.0)] * N_DRONES
+                    safe = [(0.0, 0.0)] * n_drones
                 else:
                     # MULTI-AGENT ORCA
 
                     safe = []
 
                     try:
-                        for i in range(N_DRONES):
+                        for i in range(n_drones):
                             constraints = []
 
-                            for j in range(N_DRONES):
+                            for j in range(n_drones):
                                 if i == j:
                                     continue
 
@@ -724,7 +753,7 @@ def run(args):
                                 print(f"Preferred velocity: {preferred[i]}")
                                 print(f"Max speed: {args.max_speed}")
 
-                                for j in range(N_DRONES):
+                                for j in range(n_drones):
                                     if j != i:
                                         print(
                                             f"Distance CF{i + 1}-CF{j + 1}: "
@@ -757,24 +786,25 @@ def run(args):
 
                 row = {
                     't': round(t, 4),
+                    'n_drones': n_drones,
                     'strategy': args.strategy,
                     'crossing_x': center[0],
                     'crossing_y': center[1],
-                    'bias1': int(bias[0]),
-                    'bias2': int(bias[1]),
-                    'bias3': int(bias[2]),
-                    'deadlock_activations12': detectors[0].activations,
-                    'deadlock_activations13': detectors[1].activations,
-                    'deadlock_activations23': detectors[2].activations,
                     'min_distance': min_distance,
                     'all_arrived': int(all(arrived)),
-                    'goals_reached': int(completed)
+                    'goals_reached': int(completed),
+                    'active_bias_count': sum(bias),
                 }
+                for i, flag in enumerate(bias):
+                    row[f'bias{i+1}'] = int(flag)
+                for detector in detectors:
+                    i, j = detector.pair
+                    row[f'deadlock_activations{i+1}{j+1}'] = detector.activations
 
                 for (i, j), d in pair_distances.items():
                     row[f'distance_{i+1}{j+1}'] = d
 
-                for i in range(N_DRONES):
+                for i in range(n_drones):
                     k = i + 1
 
                     row.update({
@@ -814,7 +844,7 @@ def run(args):
 
                 if completed:
                     print(f'GOALS_REACHED at t={t:.3f}s')
-                    for i in range(N_DRONES):
+                    for i in range(n_drones):
                         print(f'CF{i+1}: position={positions[i]}, '
                               f'goal={goals[i]}, error={errors[i]*100:.2f}cm, '
                               f'speed={measured_speeds[i]:.4f}m/s')
@@ -861,69 +891,56 @@ def positive(value):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Three-drone common-crossing test with ORCA and PD goal controller'
-    )
-
-    parser.add_argument(
-        '--strategy',
-        choices=('orca', 'deadlock-right-bias'),
-        default='orca'
-    )
-
-    for i in range(1, 4):
-        parser.add_argument(f'--speed{i}', type=positive, default=0.10)
-
-    parser.add_argument('--max-speed', type=positive, default=0.15)
-
-    # PD goal controller
+        description='Generic N-drone common-crossing test (N>=3) using ORCA')
+    parser.add_argument('--num-drones', type=int, default=None,
+                        help='Exact number of drones; omitted = auto-detect consecutive UDP ports')
+    parser.add_argument('--max-auto-drones', type=int, default=MAX_AUTO_DRONES)
+    parser.add_argument('--base-port', type=int, default=19850)
+    parser.add_argument('--strategy', choices=('orca', 'deadlock-right-bias'),
+                        default='orca')
+    parser.add_argument('--speed', type=positive, default=0.10,
+                        help='Preferred speed for every drone (m/s)')
+    parser.add_argument('--max-speed', type=positive, default=0.8)
     parser.add_argument('--kp', type=positive, default=0.8)
     parser.add_argument('--kd', type=positive, default=1.2)
-
-    # Goal arrival verification
     parser.add_argument('--goal-tolerance', type=positive, default=0.04)
     parser.add_argument('--arrival-speed', type=positive, default=0.02)
     parser.add_argument('--arrival-hold', type=positive, default=1.0)
-
-    parser.add_argument('--radius', type=positive, default=0.25)
-    parser.add_argument('--initial-min-separation', type=positive, default=0.8)
+    parser.add_argument('--radius', type=positive, default=0.30)
+    parser.add_argument('--initial-min-separation', type=positive, default=0.80)
     parser.add_argument('--emergency-distance', type=positive, default=0.55)
     parser.add_argument('--geofence', type=positive, default=3.0)
     parser.add_argument('--duration', type=positive, default=120.0)
-    parser.add_argument('--output', default='risultati_3_droni_crossing')
+    parser.add_argument('--output', default='test_n_crossing')
     parser.add_argument('--layout-tolerance', type=positive, default=0.12)
+    parser.add_argument('--center-min-distance', type=positive, default=0.10)
     parser.add_argument('--takeoff-only', action='store_true')
-
-    # Deadlock: requires sustained low progress AND low measured speeds
-    # in a pair whose separation is below --stall-distance.
     parser.add_argument('--stall-window', type=positive, default=3.0)
     parser.add_argument('--stall-progress', type=positive, default=0.04)
     parser.add_argument('--stall-distance', type=positive, default=0.90)
     parser.add_argument('--stall-speed', type=positive, default=0.05)
     parser.add_argument('--stall-min-goal-distance', type=positive, default=0.15)
-
-    # Right-bias only after deadlock, with bounded duration and cooldown
     parser.add_argument('--bias-angle', type=positive, default=45.0)
     parser.add_argument('--bias-timeout', type=positive, default=8.0)
     parser.add_argument('--bias-cooldown', type=positive, default=3.0)
 
     args = parser.parse_args()
-    args.speeds = [getattr(args, f'speed{i}') for i in range(1, N_DRONES + 1)]
-    
-    print(f"args.emergency_distance: {args.emergency_distance}")
-    print(f"args.radius: {args.radius}")
-
-    if max(args.speeds) > args.max_speed:
-        parser.error('Preferred speeds must be <= --max-speed')
-
+    if args.num_drones is not None and args.num_drones < MIN_DRONES:
+        parser.error(f'--num-drones must be >= {MIN_DRONES}')
+    if args.max_auto_drones < MIN_DRONES:
+        parser.error(f'--max-auto-drones must be >= {MIN_DRONES}')
+    if not (1 <= args.base_port <= 65535 - args.max_auto_drones):
+        parser.error('--base-port is outside valid UDP port range')
+    if args.speed > args.max_speed:
+        parser.error('--speed must be <= --max-speed')
     if args.initial_min_separation <= 2 * args.radius:
         parser.error('Initial separation must exceed combined ORCA radius')
-
     if args.emergency_distance >= 2 * args.radius:
         parser.error('Emergency distance must be smaller than combined ORCA radius')
-
     if args.bias_angle > 90:
         parser.error('Right-bias angle must be <= 90 degrees')
-
+    print(f'ORCA radius: {args.radius} m; emergency distance: '
+          f'{args.emergency_distance} m')
     run(args)
 
 
